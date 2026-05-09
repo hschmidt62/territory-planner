@@ -1,0 +1,28 @@
+{
+  "vehicles": [
+    {
+      "vin": "4S4GUHF6XS3713787",
+      "nickname": "",
+      "make": "",
+      "model": "",
+      "model_year": 2025,
+      "trim": "",
+      "odometer": 1234,
+      "odometer_updated": "2026-05-09",
+      "annual_mileage_estimate": 12000,
+      "dealer": {
+        "name": "Georgetown Subaru",
+        "city": "",
+        "phone": "",
+        "scheduler_url": ""
+      },
+      "owner_contact": {
+        "name": "",
+        "phone": "",
+        "telegram_chat_id": ""
+      },
+      "service_log": [],
+      "acknowledged_recalls": []
+    }
+  ]
+}
