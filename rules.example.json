@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Newsletters",
+    "folder": "Newsletters",
+    "from_contains": ["newsletter@", "noreply@", "no-reply@"]
+  },
+  {
+    "name": "GitHub notifications",
+    "folder": "GitHub",
+    "from_contains": ["@github.com"]
+  },
+  {
+    "name": "Receipts",
+    "folder": "Receipts",
+    "subject_regex": "(receipt|invoice|order (confirmation|#))"
+  }
+]
