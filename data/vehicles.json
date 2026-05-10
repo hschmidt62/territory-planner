@@ -22,7 +22,22 @@
         "telegram_chat_id": ""
       },
       "service_log": [],
-      "acknowledged_recalls": []
+      "acknowledged_recalls": [],
+      "notification_policy": {
+        "enabled": true,
+        "escalation_days": [
+          7,
+          14,
+          21
+        ],
+        "frequency_by_level": [
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "due_state": []
     }
   ]
 }

@@ -33,58 +33,61 @@ jobs:
         id: check
         run: |
           set -e
-          python -m car.check > /tmp/report.md || true
-          if [ -s /tmp/report.md ]; then
-            echo "has_report=true" >> "$GITHUB_OUTPUT"
+          python -m car.check
+          if [ -s /tmp/today.md ]; then
+            echo "has_alert=true" >> "$GITHUB_OUTPUT"
           else
-            echo "has_report=false" >> "$GITHUB_OUTPUT"
+            echo "has_alert=false" >> "$GITHUB_OUTPUT"
           fi
+          echo "title=$(cat /tmp/title.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Commit hydrated VIN data
+      - name: Commit hydrated VIN data + nag state
         if: github.event_name != 'pull_request'
         run: |
           if ! git diff --quiet -- data/vehicles.json; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add data/vehicles.json
-            git commit -m "chore(car): hydrate VIN-decoded fields [skip ci]"
+            git commit -m "chore(car): update nag state [skip ci]"
             git push
           fi
 
-      - name: Open or update issue
-        if: steps.check.outputs.has_report == 'true'
+      - name: Update or open rolling Issue
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const body = fs.readFileSync('/tmp/report.md', 'utf8');
-            const title = `Car maintenance — ${new Date().toISOString().slice(0,10)}`;
+            const title = fs.readFileSync('/tmp/title.txt', 'utf8').trim();
+            const todayComment = fs.readFileSync('/tmp/today.md', 'utf8');
+
             const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: 'car-maintenance',
-              state: 'open',
-              per_page: 100,
+              owner: context.repo.owner, repo: context.repo.repo,
+              labels: 'car-maintenance', state: 'open', per_page: 100,
             });
-            // Reuse a single rolling issue: edit the body of the most recent open one,
-            // otherwise open a new one.
+
+            let issue;
             if (existing.length) {
-              const issue = existing[0];
+              issue = existing[0];
               await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                title,
-                body,
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, title, body,
               });
               core.notice(`Updated issue #${issue.number}`);
             } else {
               const { data: created } = await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-                labels: ['car-maintenance'],
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['car-maintenance'],
               });
+              issue = created;
               core.notice(`Opened issue #${created.number}`);
+            }
+
+            // Each day with active alerts adds a fresh comment so the phone notification fires.
+            if (todayComment.trim().length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, body: todayComment,
+              });
+              core.notice(`Posted today's nag comment on #${issue.number}`);
             }

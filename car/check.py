@@ -1,19 +1,34 @@
-"""Daily check: decode any new VIN, project mileage, find due services and recalls.
+"""Daily check.
 
-Outputs a Markdown report on stdout. Exits 0 always; the caller decides what
-to do with the report (open a GitHub Issue, send a Telegram message, etc.).
+Decodes any new VIN, projects mileage, identifies due services and recalls,
+runs the nag policy, persists DueState updates, and emits two artifacts:
+
+- /tmp/report.md  : the rolling Issue body (current full state)
+- /tmp/today.md   : today's nag comment (empty if nothing to alert about)
+- /tmp/title.txt  : suggested Issue title with the highest active escalation
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from .store import Vehicle, load_vehicles, save_vehicles
+from .store import (
+    DueState,
+    Vehicle,
+    load_vehicles,
+    save_vehicles,
+)
 from .decode import decode_vin
 from .recalls import fetch_recalls, summarize
 from .intervals import for_make, Interval
+from .policy import decide, escalation_level, LEVEL_EMOJI, LEVEL_LABEL
 
+
+# ----- Hydration ------------------------------------------------------------
 
 def _hydrate(v: Vehicle) -> bool:
     """Decode VIN if make/model/year are blank. Returns True if anything changed."""
@@ -35,8 +50,18 @@ def _hydrate(v: Vehicle) -> bool:
     return changed
 
 
+# ----- Due-item detection ---------------------------------------------------
+
+@dataclass
+class DueItem:
+    item_id: str        # stable id, e.g. "service:oil_and_filter" or "recall:23V456"
+    kind: str           # "service" | "recall"
+    title: str          # human-readable
+    detail: str = ""    # one-liner reason / consequence
+    booking_hint: str = ""  # extra advice (e.g. recall remedy)
+
+
 def _last_service(v: Vehicle, name: str) -> tuple[int | None, str | None]:
-    """Most recent (odometer, date) for a given service name, or (None, None)."""
     matches = [e for e in v.service_log if e.service == name]
     if not matches:
         return (None, None)
@@ -44,111 +69,202 @@ def _last_service(v: Vehicle, name: str) -> tuple[int | None, str | None]:
     return (last.odometer, last.date)
 
 
-def _due(v: Vehicle, interval: Interval, today: date) -> tuple[bool, str]:
-    """Return (is_due, reason)."""
+def _service_due(v: Vehicle, interval: Interval, today: date) -> str:
+    """Return reason string if the service is currently due, else ''."""
     last_mi, last_date = _last_service(v, interval.name)
     proj = v.projected_odometer(today)
 
-    # Mileage check (uses projected odometer if no service has been logged yet)
-    if interval.mileage is not None:
+    if interval.mileage is not None and proj is not None:
         baseline = last_mi if last_mi is not None else 0
-        if proj is not None and proj - baseline >= interval.mileage:
-            mi_since = proj - baseline
-            return (True, f"~{mi_since:,} mi since last (interval {interval.mileage:,} mi)")
+        if proj - baseline >= interval.mileage:
+            return f"~{proj - baseline:,} mi since last (interval {interval.mileage:,} mi)"
 
-    # Time check
-    if interval.months is not None:
-        if last_date:
-            try:
-                last = date.fromisoformat(last_date)
-            except ValueError:
-                last = None
-        else:
-            last = None
-        if last:
-            months_since = (today.year - last.year) * 12 + (today.month - last.month)
-            if months_since >= interval.months:
-                return (True, f"{months_since} months since last (interval {interval.months} months)")
-        # No service ever logged: only flag time-only items if odometer was first
-        # logged > N months ago, so a brand new entry doesn't immediately fire.
+    if interval.months is not None and last_date:
+        try:
+            last = date.fromisoformat(last_date)
+        except ValueError:
+            return ""
+        months_since = (today.year - last.year) * 12 + (today.month - last.month)
+        if months_since >= interval.months:
+            return f"{months_since} months since last (interval {interval.months} months)"
 
-    return (False, "")
+    return ""
 
 
-def render_report(vehicles: list[Vehicle], today: date | None = None) -> str:
-    today = today or date.today()
-    out: list[str] = []
-    any_alert = False
+def find_due(v: Vehicle, today: date) -> list[DueItem]:
+    items: list[DueItem] = []
 
+    for interval in for_make(v.make):
+        reason = _service_due(v, interval, today)
+        if reason:
+            items.append(DueItem(
+                item_id=f"service:{interval.name}",
+                kind="service",
+                title=interval.description,
+                detail=reason,
+            ))
+
+    try:
+        recalls = fetch_recalls(v.make, v.model, v.model_year or 0)
+    except Exception as e:  # noqa: BLE001
+        recalls = []
+        print(f"<!-- recall fetch failed for {v.vin}: {e} -->", file=sys.stderr)
+    for r in recalls:
+        cid = r.get("NHTSACampaignNumber", "")
+        if not cid or cid in v.acknowledged_recalls:
+            continue
+        s = summarize(r)
+        items.append(DueItem(
+            item_id=f"recall:{cid}",
+            kind="recall",
+            title=f"Recall {cid}: {s['component']}",
+            detail=(s["consequence"] or "")[:300],
+            booking_hint=(s["remedy"] or "")[:300],
+        ))
+    return items
+
+
+# ----- Rendering -----------------------------------------------------------
+
+def _vehicle_label(v: Vehicle) -> str:
+    parts = [str(v.model_year or ""), v.make, v.model, v.trim]
+    label = " ".join(p for p in parts if p).strip()
+    return v.nickname or label or v.vin
+
+
+def render_body(vehicles: list[Vehicle], today: date) -> str:
+    lines = [f"# Car maintenance — last checked {today.isoformat()}", ""]
     for v in vehicles:
-        title = " ".join(
-            part for part in (str(v.model_year or ""), v.make, v.model, v.trim) if part
-        ).strip() or v.vin
-        out.append(f"## {v.nickname or title}")
-        out.append(f"- VIN: `{v.vin}`")
+        lines.append(f"## {_vehicle_label(v)}")
+        lines.append(f"- VIN: `{v.vin}`")
         if v.odometer is not None:
             proj = v.projected_odometer(today)
             note = f" (projected today: ~{proj:,} mi)" if proj and proj != v.odometer else ""
-            out.append(f"- Odometer: {v.odometer:,} mi as of {v.odometer_updated or 'unknown'}{note}")
+            lines.append(f"- Odometer: {v.odometer:,} mi as of {v.odometer_updated or 'unknown'}{note}")
         else:
-            out.append("- Odometer: **not logged yet** — see instructions below")
+            lines.append("- Odometer: **not logged yet** — `python -m car mileage <VIN> <miles>` or comment `mileage 12345` on this issue")
 
-        # Service intervals
-        due_items: list[str] = []
-        for interval in for_make(v.make):
-            is_due, reason = _due(v, interval, today)
-            if is_due:
-                due_items.append(f"  - **{interval.description}** — {reason}")
-        if due_items:
-            any_alert = True
-            out.append("")
-            out.append("### Service due")
-            out.extend(due_items)
+        # Active due items with nag state
+        active_states = {s.item_id: s for s in v.due_state if not s.acknowledged_at}
+        if active_states:
+            lines.append("")
+            lines.append("### Active alerts")
+            for st in active_states.values():
+                level, days = escalation_level(st, v.notification_policy, today)
+                emoji = LEVEL_EMOJI[min(level, len(LEVEL_EMOJI) - 1)]
+                tag = f"{emoji} " if emoji else ""
+                lines.append(f"- {tag}`{st.item_id}` — first alerted {st.first_alerted_at} ({days} days), {st.alert_count} pings"
+                             + (f", snoozed until {st.snoozed_until}" if st.snoozed_until else ""))
+            lines.append("")
+            lines.append("Reply to this issue with: `done <item_id>`, `snooze <item_id> 5d`, or `mileage 12345`.")
+        else:
+            lines.append("- All clear. Nice.")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
-        # Recalls
-        try:
-            recalls = fetch_recalls(v.make, v.model, v.model_year or 0)
-        except Exception as e:  # noqa: BLE001
-            recalls = []
-            print(f"<!-- recall fetch failed for {v.vin}: {e} -->", file=sys.stderr)
-        new_recalls = [r for r in recalls if r.get("NHTSACampaignNumber") not in v.acknowledged_recalls]
-        if new_recalls:
-            any_alert = True
-            out.append("")
-            out.append(f"### Open recalls ({len(new_recalls)})")
-            for r in new_recalls:
-                s = summarize(r)
-                out.append(f"- **{s['component']}** ({s['campaign_id']})")
-                if s["consequence"]:
-                    out.append(f"  - Risk: {s['consequence'][:300]}")
-                if s["remedy"]:
-                    out.append(f"  - Remedy: {s['remedy'][:300]}")
 
-        if not due_items and not new_recalls and v.odometer is not None:
-            out.append("- All clear.")
+def render_today_comment(per_vehicle: dict[str, list[tuple[DueItem, int, int]]], today: date, vehicles: list[Vehicle]) -> tuple[str, int]:
+    """Build today's nag comment. Returns (markdown, max_level_today)."""
+    if not per_vehicle:
+        return ("", 0)
 
-        out.append("")
+    max_level = max(level for items in per_vehicle.values() for _, level, _ in items)
+    emoji = LEVEL_EMOJI[min(max_level, len(LEVEL_EMOJI) - 1)]
+    prefix = f"{emoji} " if emoji else ""
 
-    if not any_alert and all(v.odometer is not None for v in vehicles):
-        return ""  # caller can use empty string as "nothing to report"
+    headers = {
+        0: f"Maintenance due — {today.isoformat()}",
+        1: f"Still overdue — week 1 — {today.isoformat()}",
+        2: f"**Two weeks overdue** — {today.isoformat()}",
+        3: f"**THREE+ WEEKS OVERDUE** — {today.isoformat()}",
+    }
+    lines = [f"## {prefix}{headers[min(max_level, 3)]}", ""]
 
-    header = f"# Car maintenance check — {today.isoformat()}\n\n"
-    return header + "\n".join(out).rstrip() + "\n"
+    by_vin = {v.vin: v for v in vehicles}
+    for vin, items in per_vehicle.items():
+        v = by_vin[vin]
+        lines.append(f"**{_vehicle_label(v)}**")
+        for item, level, days in items:
+            tag = LEVEL_EMOJI[min(level, len(LEVEL_EMOJI) - 1)]
+            tag = f"{tag} " if tag else ""
+            day_note = "due today" if days == 0 else f"day {days}"
+            lines.append(f"- {tag}**{item.title}** (`{item.item_id}`) — {day_note}. {item.detail}")
+            if max_level >= 2 and item.booking_hint:
+                lines.append(f"  - {item.booking_hint}")
+            if max_level >= 3:
+                url = (v.dealer or {}).get("scheduler_url", "")
+                if url:
+                    lines.append(f"  - **Book now:** {url}")
+                else:
+                    name = (v.dealer or {}).get("name", "your dealer")
+                    lines.append(f"  - **Call {name} today.**")
+        lines.append("")
+
+    if max_level >= 1:
+        lines.append("---")
+        lines.append("Reply to silence: `done <item_id>` (handled it) · `snooze <item_id> 7d` · `ack <item_id>` (mute without booking).")
+    return ("\n".join(lines).rstrip() + "\n", max_level)
+
+
+# ----- Main pipeline -------------------------------------------------------
+
+def run(today: date | None = None) -> tuple[str, str, int]:
+    """Compute outputs without I/O. Returns (body_md, today_comment_md, max_level)."""
+    today = today or date.today()
+    vehicles = load_vehicles()
+    if not vehicles:
+        return ("No vehicles configured in data/vehicles.json\n", "", 0)
+
+    if any(_hydrate(v) for v in vehicles):
+        save_vehicles(vehicles)
+
+    per_vehicle_today: dict[str, list[tuple[DueItem, int, int]]] = {}
+
+    for v in vehicles:
+        due = find_due(v, today)
+        active_ids = {d.item_id for d in due}
+
+        # Drop state for items that are no longer due (likely the user logged the service)
+        v.due_state = [s for s in v.due_state if s.item_id in active_ids]
+
+        for d in due:
+            state = v.get_due_state(d.item_id)
+            if state is None:
+                state = DueState(item_id=d.item_id, first_alerted_at=today.isoformat())
+                v.due_state.append(state)
+
+            decision = decide(state, v.notification_policy, today)
+            if decision.fire:
+                state.last_alerted_at = today.isoformat()
+                state.alert_count += 1
+                per_vehicle_today.setdefault(v.vin, []).append((d, decision.level, decision.days_since_first_alert))
+
+    save_vehicles(vehicles)
+
+    body = render_body(vehicles, today)
+    comment, max_level = render_today_comment(per_vehicle_today, today, vehicles)
+    return (body, comment, max_level)
 
 
 def main(argv: list[str] | None = None) -> int:
-    vehicles = load_vehicles()
-    if not vehicles:
-        print("No vehicles configured in data/vehicles.json", file=sys.stderr)
-        return 0
+    body, comment, max_level = run()
 
-    changed = any(_hydrate(v) for v in vehicles)
-    if changed:
-        save_vehicles(vehicles)
+    out_dir = Path(os.environ.get("CAR_OUT_DIR", "/tmp"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.md").write_text(body)
+    (out_dir / "today.md").write_text(comment)
+    title_emoji = LEVEL_EMOJI[min(max_level, len(LEVEL_EMOJI) - 1)]
+    title_label = LEVEL_LABEL[min(max_level, len(LEVEL_LABEL) - 1)]
+    title = f"Car maintenance — {title_label}" if comment else "Car maintenance — all clear"
+    if title_emoji:
+        title = f"{title_emoji} {title}"
+    (out_dir / "title.txt").write_text(title + "\n")
 
-    report = render_report(vehicles)
-    if report:
-        sys.stdout.write(report)
+    # Echo to stdout so workflow logs are useful
+    sys.stdout.write(body)
+    if comment:
+        sys.stdout.write("\n---\n")
+        sys.stdout.write(comment)
     return 0
 
 

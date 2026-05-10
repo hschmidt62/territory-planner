@@ -1,0 +1,65 @@
+name: Car maintenance ack
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  apply:
+    # Only on issues we labeled, and only on comments by the repo owner.
+    if: >-
+      github.event.issue.pull_request == null &&
+      contains(join(github.event.issue.labels.*.name, ','), 'car-maintenance') &&
+      github.event.comment.user.login == github.event.repository.owner.login
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install click
+
+      - name: Apply comment commands
+        id: apply
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -e
+          printf '%s' "$COMMENT_BODY" | python -m car.ack > /tmp/effects.md
+          if grep -q '^- ' /tmp/effects.md; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit changes
+        if: steps.apply.outputs.applied == 'true'
+        run: |
+          if ! git diff --quiet -- data/vehicles.json; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/vehicles.json
+            git commit -m "chore(car): apply ack from issue comment [skip ci]"
+            git push
+          fi
+
+      - name: Reply with confirmation
+        if: steps.apply.outputs.applied == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const effects = fs.readFileSync('/tmp/effects.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Got it. Applied:\n\n${effects}`,
+            });
